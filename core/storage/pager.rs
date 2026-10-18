@@ -20,7 +20,7 @@ use crate::sync::atomic::{
     AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 use crate::sync::Arc;
-use crate::sync::{Mutex, RwLock};
+use crate::sync::{ArcMutexGuard, Mutex, RwLock};
 use crate::types::IOResultOr;
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
@@ -1612,7 +1612,9 @@ pub struct Pager {
     checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
     auto_vacuum_mode: AtomicU8,
-    /// Mutex for synchronizing database initialization to prevent race conditions
+    /// Mutex for synchronizing database initialization to prevent race conditions.
+    /// Shared by all pagers of the database; the pager allocating page 1 keeps an
+    /// owned guard inside its [AllocatePage1State] across the page-1 write and fsync.
     init_lock: Arc<Mutex<()>>,
     /// The state of the current allocate page operation.
     allocate_page_state: RwLock<AllocatePageState>,
@@ -1802,16 +1804,25 @@ enum AllocatePageState {
     },
 }
 
+/// Guard on [Pager::init_lock] owned by the pager allocating page 1. It lives
+/// inside the `Writing`/`Syncing` states (in an `Arc` only because the state is
+/// cloned out of its lock on every step) so the lock stays held while the
+/// page-1 write and fsync are in flight, and is released when the state moves
+/// to `Done` or back to `Start`.
+type InitLockGuard = Arc<ArcMutexGuard<()>>;
+
 #[derive(Clone)]
 enum AllocatePage1State {
     Start,
     Writing {
         page: PageRef,
+        init_lock: InitLockGuard,
     },
     /// Fsyncing the freshly written page 1 to the main database file, so a
     /// WAL can never exist next to an empty (0-byte on disk) database file.
     Syncing {
         page: PageRef,
+        init_lock: InitLockGuard,
     },
     Done,
 }
@@ -3297,16 +3308,12 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn maybe_allocate_page1(&self) -> IOResultOr<()> {
-        if !self.db_initialized() {
-            #[cfg(test)]
-            self.run_allocate_page1_gap_hook();
-            if let Some(_lock) = self.init_lock.try_lock() {
-                return Ok(self.allocate_page1()?.map(|_| ()));
-            }
-            // Give a chance for the allocation to happen elsewhere
-            io_yield_one!(Completion::new_yield());
+        if self.db_initialized() {
+            return Ok(IOResult::Done(()));
         }
-        Ok(IOResult::Done(()))
+        #[cfg(test)]
+        self.run_allocate_page1_gap_hook();
+        self.allocate_page1()
     }
 
     #[inline(always)]
@@ -5665,12 +5672,35 @@ impl Pager {
         Ok(IOResult::Done(()))
     }
 
+    /// Allocate page 1 of an empty database. [Pager::init_lock] is taken in
+    /// `Start` and held until the page is written (and fsynced) and published,
+    /// so exactly one pager allocates page 1: the others yield while the lock
+    /// is held and find the database initialized once it is released.
+    /// Callers normally go through [Pager::maybe_allocate_page1].
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn allocate_page1(&self) -> IOResultOr<PageRef> {
+    pub fn allocate_page1(&self) -> IOResultOr<()> {
+        let result = self.allocate_page1_step();
+        if result.is_err() {
+            // Don't stay parked in `Writing`/`Syncing` holding the lock: go back
+            // to `Start` so this or any other pager can retry the allocation.
+            self.reset_allocate_page1();
+        }
+        result
+    }
+
+    fn allocate_page1_step(&self) -> IOResultOr<()> {
         let state = self.allocate_page1_state.read().clone();
         match state {
             AllocatePage1State::Start => {
-                turso_assert!(!self.db_initialized());
+                let Some(init_lock) = self.init_lock.try_lock_arc() else {
+                    // Give a chance for the allocation to happen elsewhere
+                    io_yield_one!(Completion::new_yield());
+                };
+                // The pager that held the lock may have just finished: it clears
+                // `init_page_1` before releasing the lock, so check again under it.
+                if self.db_initialized() {
+                    return Ok(IOResult::Done(()));
+                }
                 tracing::trace!("allocate_page1(Start)");
 
                 let IOResult::Done(mut default_header) = self.with_header(|header| *header)? else {
@@ -5722,10 +5752,13 @@ impl Pager {
 
                 // Pin page1 to prevent eviction while stored in state machine
                 page1.pin();
-                *self.allocate_page1_state.write() = AllocatePage1State::Writing { page: page1 };
+                *self.allocate_page1_state.write() = AllocatePage1State::Writing {
+                    page: page1,
+                    init_lock: Arc::new(init_lock),
+                };
                 io_yield_one!(c);
             }
-            AllocatePage1State::Writing { page } => {
+            AllocatePage1State::Writing { page, init_lock } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done)");
                 if self.wal.is_some() {
@@ -5743,14 +5776,18 @@ impl Pager {
                         self.syncing.clone(),
                         self.get_sync_type(),
                     )?;
-                    *self.allocate_page1_state.write() = AllocatePage1State::Syncing { page };
+                    *self.allocate_page1_state.write() =
+                        AllocatePage1State::Syncing { page, init_lock };
                     io_yield_one!(c);
                 }
                 self.finish_allocate_page1(page)
             }
-            AllocatePage1State::Syncing { page } => {
+            AllocatePage1State::Syncing { page, init_lock } => {
                 tracing::trace!("allocate_page1(Syncing done)");
-                self.finish_allocate_page1(page)
+                let result = self.finish_allocate_page1(page);
+                // Released only now that `init_page_1` has been cleared.
+                drop(init_lock);
+                result
             }
             AllocatePage1State::Done => unreachable!("cannot try to allocate page 1 again"),
         }
@@ -5758,8 +5795,10 @@ impl Pager {
 
     /// Final step of [Pager::allocate_page1]: page 1 is written (and, for
     /// WAL-backed databases, fsync'd) to the main database file; publish it
-    /// in the page cache and mark the database initialized.
-    fn finish_allocate_page1(&self, page: PageRef) -> IOResultOr<PageRef> {
+    /// in the page cache and mark the database initialized. Moving to `Done`
+    /// releases `init_lock`, after `init_page_1` has been cleared, so a pager
+    /// that takes the lock next sees the database as initialized.
+    fn finish_allocate_page1(&self, page: PageRef) -> IOResultOr<()> {
         let page_key = PageCacheKey::new(page.get().id());
         let mut cache = self.page_cache.write();
         cache.insert(page_key, page.clone()).map_err(|e| {
@@ -5769,7 +5808,19 @@ impl Pager {
         self.init_page_1.store(None);
         page.unpin();
         *self.allocate_page1_state.write() = AllocatePage1State::Done;
-        Ok(IOResult::Done(page))
+        Ok(IOResult::Done(()))
+    }
+
+    /// Abandon an allocation left in `Writing`/`Syncing`: unpin page 1 and go
+    /// back to `Start`, which also releases `init_lock`. No-op in `Start`/`Done`.
+    fn reset_allocate_page1(&self) {
+        let mut state = self.allocate_page1_state.write();
+        if let AllocatePage1State::Writing { page, .. } | AllocatePage1State::Syncing { page, .. } =
+            &*state
+        {
+            page.unpin();
+            *state = AllocatePage1State::Start;
+        }
     }
 
     pub fn allocating_page1(&self) -> bool {
@@ -6117,6 +6168,9 @@ impl Pager {
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().reset();
         *self.allocate_page_state.write() = AllocatePageState::Start;
+        // An abandoned allocation (statement reset or dropped, connection
+        // closed) must release `init_lock`, or every other pager yields forever.
+        self.reset_allocate_page1();
         *self.free_page_state.write() = FreePageState::Start;
         *self.spill_state.write() = SpillState::Idle;
         #[cfg(feature = "autovacuum")]
@@ -6882,6 +6936,63 @@ mod allocate_page1_tests {
             Ok(result) => result.unwrap(),
         }
         assert_two_tables_and_clean_pagers(&[&a, &b]);
+    }
+
+    /// Steps B's first write, driving the IO in between, until it is done or
+    /// `max_steps` is reached.
+    #[cfg(feature = "io_memory_yield")]
+    fn first_write_completes(b: &Arc<Connection>, io: &crate::MemoryYieldIO, max_steps: usize) {
+        let mut stmt_b = b.prepare("CREATE TABLE u(y INTEGER)").unwrap();
+        for _ in 0..max_steps {
+            match stmt_b.step().unwrap() {
+                StepResult::Done => return,
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {}
+                other => panic!("unexpected step result {other:?}"),
+            }
+            io.step().unwrap();
+        }
+        panic!("B's first write did not complete within {max_steps} steps: init_lock was never released");
+    }
+
+    /// A statement dropped while its pager is writing page 1 must release
+    /// `init_lock` on the way out: other pagers yield (not Busy) while it is
+    /// held, so a leaked lock would park every first write forever.
+    #[cfg(feature = "io_memory_yield")]
+    #[test]
+    fn dropped_statement_releases_init_lock_mid_allocation() {
+        let io = Arc::new(crate::MemoryYieldIO::new());
+        let db = open_test_database(io.clone(), "page1_dropped.db");
+        let a = db.connect().unwrap();
+        let b = db.connect().unwrap();
+
+        let stmt_a = park_in_page1_write(&a, &io);
+        assert!(a.pager.load().init_lock.try_lock().is_none());
+        drop(stmt_a);
+
+        first_write_completes(&b, &io, 100);
+        assert!(!a.pager.load().allocating_page1());
+        assert!(b.is_db_initialized());
+        assert_eq!(query_single(&b, "PRAGMA integrity_check").to_string(), "ok");
+    }
+
+    /// Same as above, but the connection is closed while the statement is
+    /// still alive.
+    #[cfg(feature = "io_memory_yield")]
+    #[test]
+    fn closed_connection_releases_init_lock_mid_allocation() {
+        let io = Arc::new(crate::MemoryYieldIO::new());
+        let db = open_test_database(io.clone(), "page1_closed.db");
+        let a = db.connect().unwrap();
+        let b = db.connect().unwrap();
+
+        let stmt_a = park_in_page1_write(&a, &io);
+        a.close().unwrap();
+        drop(stmt_a);
+
+        first_write_completes(&b, &io, 100);
+        assert!(!a.pager.load().allocating_page1());
+        assert!(b.is_db_initialized());
+        assert_eq!(query_single(&b, "PRAGMA integrity_check").to_string(), "ok");
     }
 }
 

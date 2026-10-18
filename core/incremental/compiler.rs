@@ -2587,7 +2587,7 @@ mod tests {
         let conn = db.connect().unwrap();
         let pager = conn.pager.load().clone();
 
-        let _ = pager.io.block(|| pager.allocate_page1()).unwrap();
+        pager.io.block(|| pager.allocate_page1()).unwrap();
 
         let main_root_page = pager
             .io
