@@ -19386,6 +19386,11 @@ pub(crate) struct VacuumIntoOpContext {
     escaped_schema_name: String,
     /// Keep output database alive while vacuum is in progress.
     _output_db: Option<Arc<Database>>,
+    /// Where a file-backed copy is built — a temporary file moved to the
+    /// destination once complete, or the destination itself — and how the
+    /// destination is left as found on failure. None for an in-memory
+    /// output.
+    output_file: Option<crate::vdbe::vacuum::VacuumIntoOutputFile>,
     /// Configuration for the shared vacuum target build state machine.
     target_build_config: Option<VacuumTargetBuildConfig>,
     /// Context for the shared vacuum target build state machine.
@@ -19471,8 +19476,23 @@ fn cleanup_op_vacuum_into(
         target_build_context.cleanup_after_error()?;
     }
 
+    let copy_committed = vacuum_state
+        .target_build_context
+        .as_ref()
+        .is_some_and(|target_build_context| target_build_context.committed());
     vacuum_state.target_build_context = None;
     vacuum_state._output_db = None;
+    // The output database is closed above; leave the destination as it
+    // was found: the temporary copy goes, or a destination the copy was
+    // built at is emptied again (unless the copy committed there and only
+    // its checkpoint failed).
+    if let Err(err) = vacuum_state
+        .output_file
+        .take()
+        .map_or(Ok(()), |output_file| output_file.discard(copy_committed))
+    {
+        tracing::warn!("VACUUM INTO could not discard its failed copy: {err}");
+    }
 
     if state.auto_txn_cleanup == TxnCleanup::RollbackTxn {
         let pager = connection.pager.load();
@@ -19544,8 +19564,10 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     .into());
                 }
 
-                // we always vacuum into a new file, so check if it exists
-                if std::path::Path::new(dest_path).exists() {
+                // A pre-existing empty file is allowed: VACUUM INTO builds
+                // the copy in place there (see VacuumIntoOutputFile). A
+                // non-empty file is refused, as it always was.
+                if std::fs::metadata(dest_path).is_ok_and(|m| m.len() > 0) {
                     return Err(LimboError::ParseError(format!(
                         "output file already exists: {dest_path}"
                     ))
@@ -19605,14 +19627,26 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 // can resolve custom types, generated columns, vtab modules, etc.
                 let output_opts = vacuum_target_opts_from_source(&source_db);
 
-                // Always use PlatformIO for the output file, even if source
-                // is in-memory. This ensures VACUUM INTO writes to disk.
-                let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+                // A file-backed copy is written through the source database's
+                // IO, so a database under a test IO copies through it as well;
+                // a source that lives in memory has no file IO, so its copy
+                // goes through the platform's. The copy is built in a temporary
+                // file beside the destination and moved there once complete,
+                // unless the destination already exists or the IO cannot rename
+                // a file (see VacuumIntoOutputFile).
+                let io: Arc<dyn crate::IO> = if source_db.is_in_memory_db() {
+                    Arc::new(crate::io::PlatformIO::new()?)
+                } else {
+                    source_db.io.clone()
+                };
+                let output_file =
+                    crate::vdbe::vacuum::VacuumIntoOutputFile::prepare(io.clone(), dest_path)?;
+                let build_path = output_file.build_path().to_string();
                 let page_codec = source_pager.page_codec_external();
                 let output_db = match &page_codec {
                     Some(codec) => crate::Database::open(
                         io,
-                        dest_path,
+                        &build_path,
                         crate::OpenOptions::new(source_db.dialect())
                             .flags(OpenFlags::Create)
                             .db_opts(output_opts)
@@ -19620,7 +19654,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     )?,
                     None => crate::Database::open_file_with_flags(
                         io,
-                        dest_path,
+                        &build_path,
                         OpenFlags::Create,
                         output_opts,
                         None,
@@ -19649,10 +19683,23 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     target_mvcc_enabled: source_db.mvcc_enabled(),
                     target_auto_vacuum_mode: source_auto_vacuum_mode,
                     copy_mvcc_metadata_table: false,
-                    commit_every: Some(crate::vdbe::vacuum::VacuumCommitBatch::VACUUM_INTO),
+                    // Only a copy built in a temporary file is committed in
+                    // batches: a batch that failed, or a process that died,
+                    // leaves a partial copy there, which goes, and the
+                    // destination is untouched until the complete copy is
+                    // moved over it. A copy built at the destination itself —
+                    // an existing empty file, an IO that cannot rename — is
+                    // one transaction, so that it is all or nothing there
+                    // too: a failure rolls it back and leaves no rows. That
+                    // costs the memory bound on those paths, as the copy was
+                    // before it was batched.
+                    commit_every: output_file
+                        .is_temporary()
+                        .then_some(crate::vdbe::vacuum::VacuumCommitBatch::VACUUM_INTO),
                 };
 
                 vacuum_state._output_db = Some(output_db);
+                vacuum_state.output_file = Some(output_file);
                 vacuum_state.target_build_config = Some(config);
                 vacuum_state.target_build_context =
                     Some(VacuumTargetBuildContext::new(output_conn));
@@ -19688,6 +19735,18 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     .as_ref()
                     .expect("VacuumTargetBuildContext must be set in FinalizeOutput state");
                 crate::vdbe::vacuum::finalize_vacuum_into_output(target_build_context)?;
+                // The copy is complete and synced: close it, then move it to
+                // the destination (a copy built there is in place already).
+                // Until the move the destination is untouched, and a failure
+                // here discards the copy like any earlier failure.
+                vacuum_state.target_build_context = None;
+                vacuum_state._output_db = None;
+                if let Some(output_file) = vacuum_state.output_file.take() {
+                    if let Err(err) = output_file.install() {
+                        vacuum_state.output_file = Some(output_file);
+                        return Err(err.into());
+                    }
+                }
                 vacuum_state.phase = VacuumIntoOpPhase::Done;
                 continue;
             }

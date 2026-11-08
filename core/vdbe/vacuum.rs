@@ -420,6 +420,184 @@ pub(crate) fn capture_custom_types(
     })
 }
 
+/// Where a `VACUUM INTO` copy is built and how the destination is left if it
+/// fails. The copy is built in a temporary file beside the destination and
+/// moved there in one step once complete, so the destination goes from absent
+/// to a complete copy and never holds a half-written one. Two cases cannot
+/// use that temporary file and build the copy at the destination directly, as
+/// it always was: the destination file already exists (an empty file,
+/// possibly attached on this connection or created by another process that
+/// waits for it — the copy must land in that file), and an IO that cannot
+/// rename a file ([`crate::IO::supports_rename`] — in-memory and simulator
+/// IOs). A copy built at the destination is one transaction, not batches (see
+/// `op_vacuum_into_inner`), so a failure rolls it back and leaves no rows; and
+/// since initialising a database writes its first page to the file outside any
+/// transaction, which the next `VACUUM INTO` would refuse as an existing
+/// output, the file is then truncated back to the empty file it was. A process
+/// killed partway cannot do that: it leaves an empty database (a header page,
+/// no schema, no rows) that a retry refuses until the file is removed or
+/// emptied, as before.
+pub(crate) struct VacuumIntoOutputFile {
+    io: Arc<dyn crate::IO>,
+    dest_path: String,
+    /// The temporary copy; None when the copy is built at the destination.
+    temp_path: Option<String>,
+}
+
+impl VacuumIntoOutputFile {
+    /// Names tried before giving up on a free one, which takes a process
+    /// that reuses the pid of one that died partway, that many times.
+    const NAME_ATTEMPTS: u32 = 64;
+
+    /// Where a copy to `dest_path` is built: a temporary file named so
+    /// that no file of it exists yet, or the destination itself when it
+    /// already exists or `io` cannot move a temporary file over it.
+    pub fn prepare(io: Arc<dyn crate::IO>, dest_path: &str) -> Result<Self> {
+        if !io.supports_rename() || std::fs::metadata(dest_path).is_ok() {
+            return Ok(Self {
+                io,
+                dest_path: dest_path.to_string(),
+                temp_path: None,
+            });
+        }
+        static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let pid = std::process::id();
+        for _ in 0..Self::NAME_ATTEMPTS {
+            let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+            let this = Self {
+                io: io.clone(),
+                dest_path: dest_path.to_string(),
+                temp_path: Some(format!("{dest_path}-vacuum-{pid}-{seq}.tmp")),
+            };
+            if this
+                .temp_files()
+                .iter()
+                .all(|path| std::fs::metadata(path).is_err())
+            {
+                return Ok(this);
+            }
+        }
+        Err(LimboError::InternalError(format!(
+            "VACUUM INTO found no free name for its temporary copy beside {dest_path}"
+        )))
+    }
+
+    /// The path the copy is built at.
+    pub fn build_path(&self) -> &str {
+        self.temp_path.as_deref().unwrap_or(&self.dest_path)
+    }
+
+    /// Whether the copy is built in a temporary file, which may be
+    /// committed in batches: a failed or killed copy is discarded with it.
+    /// A copy built at the destination must be one transaction.
+    pub fn is_temporary(&self) -> bool {
+        self.temp_path.is_some()
+    }
+
+    /// The temporary copy and the files the engine keeps beside a database:
+    /// its WAL, shm and MVCC logical log. Nothing for a copy built at the
+    /// destination.
+    fn temp_files(&self) -> Vec<String> {
+        let Some(temp_path) = &self.temp_path else {
+            return Vec::new();
+        };
+        vec![
+            temp_path.clone(),
+            format!("{temp_path}-wal"),
+            format!("{temp_path}-shm"),
+            vacuum_logical_log_path(temp_path),
+        ]
+    }
+
+    /// Leaves the destination as it was found after the copy failed: the
+    /// temporary copy and its WAL, shm and MVCC logical log — only ever
+    /// files this statement created — are removed; a destination the copy
+    /// was built at is truncated back to the empty file it was, unless the
+    /// copy's transaction `committed` and only what came after (its
+    /// checkpoint) failed: then the whole copy is in that destination's
+    /// WAL, and the file is left as it is, header page and all, as before.
+    /// The output database must be closed first.
+    pub fn discard(&self, committed: bool) -> Result<()> {
+        if self.temp_path.is_none() {
+            if committed {
+                return Ok(());
+            }
+            let file = self
+                .io
+                .open_file(&self.dest_path, crate::OpenFlags::NoLock, false)?;
+            let truncated = file.truncate(0, Completion::new_trunc(|_| {}))?;
+            self.io.wait_for_completion(truncated)?;
+            let synced = file.sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)?;
+            return self.io.wait_for_completion(synced);
+        }
+        for path in self.temp_files() {
+            remove_file_if_exists(&*self.io, &path)?;
+        }
+        Ok(())
+    }
+
+    /// Moves a finished temporary copy to the destination; a copy built at
+    /// the destination is there already. The copy was checkpointed under
+    /// `SyncMode::Full` and closed, so the file is self-contained and synced
+    /// and its WAL is empty; the WAL and shm are dropped and an MVCC copy's
+    /// logical log moves with it. The move is the IO's rename, so the
+    /// destination goes from absent to complete in one step, durably. The
+    /// log moves after the copy: should the process die between the two,
+    /// the destination holds a complete copy and the log is left under the
+    /// temporary name, where it troubles nothing (a log under the
+    /// destination's name beside no database would make a later non-MVCC
+    /// copy there look corrupt). Should the log fail to move, the copy is
+    /// moved back, so the destination is as it was found.
+    pub fn install(&self) -> Result<()> {
+        let Some(temp_path) = &self.temp_path else {
+            return Ok(());
+        };
+        for sidecar in ["-wal", "-shm"] {
+            remove_file_if_exists(&*self.io, &format!("{temp_path}{sidecar}"))?;
+        }
+        self.io.rename_file(temp_path, &self.dest_path)?;
+        let temp_log = vacuum_logical_log_path(temp_path);
+        if std::fs::metadata(&temp_log).is_err() {
+            return Ok(());
+        }
+        let dest_log = vacuum_logical_log_path(&self.dest_path);
+        if let Err(err) = self.io.rename_file(&temp_log, &dest_log) {
+            if let Err(undo) = self.io.rename_file(&self.dest_path, temp_path) {
+                tracing::warn!(
+                    "VACUUM INTO could not move its copy's MVCC log to {dest_log} ({err}) \
+                     nor move the copy back from {}: {undo}",
+                    self.dest_path
+                );
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+/// The MVCC logical log the engine keeps beside the database at `db_path`,
+/// by the rule `open_mv_store` opens it with.
+fn vacuum_logical_log_path(db_path: &str) -> String {
+    crate::storage::journal_mode::logical_log_path(db_path)
+        .to_str()
+        .expect("a path derived from a str is a str")
+        .to_string()
+}
+
+fn remove_file_if_exists(io: &dyn crate::IO, path: &str) -> Result<()> {
+    not_found_is_ok(io.remove_file(path))
+}
+
+fn not_found_is_ok(result: Result<()>) -> Result<()> {
+    match result {
+        Err(LimboError::CompletionError(crate::CompletionError::IOError(
+            std::io::ErrorKind::NotFound,
+            _,
+        ))) => Ok(()),
+        result => result,
+    }
+}
+
 /// Configuration for building a compacted vacuum target database.
 /// Callers must mirror source symbols (functions, vtab modules, index methods)
 /// directly into the target connection before starting the state machine.
@@ -483,6 +661,9 @@ pub(crate) struct VacuumTargetBuildContext {
     batch_rows: u64,
     batch_bytes: u64,
     batches_since_checkpoint: u32,
+    /// Whether the target's final transaction committed: the whole copy
+    /// is in the target's WAL, whatever happens after.
+    committed: bool,
     /// Typed schema entries collected from sqlite_schema, ordered by rowid.
     schema_entries: Vec<SchemaEntry>,
     /// Storage-backed tables to CREATE (excludes sqlite_sequence).
@@ -503,12 +684,43 @@ impl VacuumTargetBuildContext {
             batch_rows: 0,
             batch_bytes: 0,
             batches_since_checkpoint: 0,
+            committed: false,
             schema_entries: Vec::new(),
             tables_to_create: Vec::new(),
             tables_to_copy: Vec::new(),
             indexes_to_create: Vec::new(),
             post_data_entries: Vec::new(),
         }
+    }
+
+    /// Whether the target's final transaction committed, so the whole
+    /// copy is in the target whatever failed after.
+    pub(crate) fn committed(&self) -> bool {
+        self.committed
+    }
+
+    /// Commits the target's transaction and opens the next, so the commit
+    /// path never holds more than what was written since the last commit.
+    /// Every `checkpoint_every_batches` commits — or at once, when
+    /// `checkpoint` asks — the target WAL is truncate-checkpointed first,
+    /// which resets its frame index (`frame_cache`) and the `-wal` file —
+    /// auto-actions are off on the target, so nothing else does. Nothing
+    /// reads the target while it is built, so the truncate always
+    /// completes.
+    fn commit_batch(&mut self, batch: VacuumCommitBatch, checkpoint: bool) -> Result<()> {
+        self.target_conn.execute("COMMIT")?;
+        self.batches_since_checkpoint += 1;
+        if checkpoint || self.batches_since_checkpoint >= batch.checkpoint_every_batches {
+            self.target_conn
+                .checkpoint(crate::CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                })?;
+            self.batches_since_checkpoint = 0;
+        }
+        self.target_conn.execute("BEGIN IMMEDIATE")?;
+        self.batch_rows = 0;
+        self.batch_bytes = 0;
+        Ok(())
     }
 
     pub(crate) fn cleanup_after_error(&mut self) -> Result<()> {
@@ -728,17 +940,15 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::PrepareCreateTable { idx } => {
                 let entries_len = state.tables_to_create.len();
                 if idx >= entries_len {
-                    // Done creating tables. A batched build creates the
-                    // indexes now (SQLite's vacuum.c order) so their pages
-                    // are committed by the row batches; one CREATE INDEX
-                    // over the copied data would be a transaction the size
-                    // of the index. A single-transaction build keeps the
-                    // index-after-data order for speed.
-                    state.phase = if config.commit_every.is_some() {
-                        VacuumTargetBuildPhase::PrepareCreateIndex { idx: 0 }
-                    } else {
-                        VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 }
-                    };
+                    // Done creating tables: copy the rows, then build the
+                    // indexes over the copied data. A batched build commits
+                    // the rows' last batch before the first index and gives
+                    // each index a transaction of its own (see
+                    // `PrepareCreateIndex`), so the bulk-sorted index build
+                    // — far faster than maintaining every index per inserted
+                    // row — keeps the memory bound. A single-transaction
+                    // build uses the same order for speed.
+                    state.phase = VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 };
                     continue;
                 }
 
@@ -804,13 +1014,8 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::StartCopyTable { table_idx } => {
                 let tables_len = state.tables_to_copy.len();
                 if table_idx >= tables_len {
-                    // Done copying all tables: deferred indexes, unless the
-                    // batched build created them up front.
-                    state.phase = if config.commit_every.is_some() {
-                        VacuumTargetBuildPhase::PreparePostData { idx: 0 }
-                    } else {
-                        VacuumTargetBuildPhase::PrepareCreateIndex { idx: 0 }
-                    };
+                    // Done copying all tables, proceed to deferred indexes.
+                    state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: 0 };
                     continue;
                 }
 
@@ -959,21 +1164,7 @@ pub(crate) fn vacuum_target_build_step(
                     // re-read more than a batch's worth of spilled pages.
                     if let Some(batch) = config.commit_every {
                         if state.batch_rows >= batch.rows || state.batch_bytes >= batch.bytes {
-                            state.target_conn.execute("COMMIT")?;
-                            state.batches_since_checkpoint += 1;
-                            if state.batches_since_checkpoint >= batch.checkpoint_every_batches {
-                                // Nothing reads the target while it is built,
-                                // so the truncate always completes.
-                                state
-                                    .target_conn
-                                    .checkpoint(crate::CheckpointMode::Truncate {
-                                        upper_bound_inclusive: None,
-                                    })?;
-                                state.batches_since_checkpoint = 0;
-                            }
-                            state.target_conn.execute("BEGIN IMMEDIATE")?;
-                            state.batch_rows = 0;
-                            state.batch_bytes = 0;
+                            state.commit_batch(batch, false)?;
                         }
                     }
                     // Go back to get next row from source
@@ -1006,14 +1197,23 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::PrepareCreateIndex { idx } => {
                 let entries_len = state.indexes_to_create.len();
                 if idx >= entries_len {
-                    // Done creating indexes: the rows next in a batched
-                    // build, otherwise the post-data objects.
-                    state.phase = if config.commit_every.is_some() {
-                        VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 }
-                    } else {
-                        VacuumTargetBuildPhase::PreparePostData { idx: 0 }
-                    };
+                    // Done creating indexes, move to post-data objects.
+                    state.phase = VacuumTargetBuildPhase::PreparePostData { idx: 0 };
                     continue;
+                }
+
+                // A batched build gives each index a transaction of its
+                // own: the rows' last batch is committed before the first
+                // index, and every index is committed and checkpointed as
+                // it completes (`StepCreateIndex`). CREATE INDEX is one
+                // statement, so an index is the smallest transaction the
+                // build can make of it, and this way the commit path holds
+                // at most the largest index's pages rather than every
+                // index's.
+                if let Some(batch) = config.commit_every {
+                    if state.batch_rows > 0 {
+                        state.commit_batch(batch, true)?;
+                    }
                 }
 
                 let entry_ordinal = state.indexes_to_create[idx];
@@ -1037,6 +1237,11 @@ pub(crate) fn vacuum_target_build_step(
                     unreachable!("CREATE INDEX statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
+                    // The index is one transaction; commit it and reset the
+                    // target WAL before the next (see `PrepareCreateIndex`).
+                    if let Some(batch) = config.commit_every {
+                        state.commit_batch(batch, true)?;
+                    }
                     state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: idx + 1 };
                     continue;
                 }
@@ -1119,6 +1324,7 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::Done => {
                 // Commit the target transaction started in Init phase.
                 state.target_conn.execute("COMMIT")?;
+                state.committed = true;
                 return Ok(crate::IOResult::Done(()));
             }
         }
